@@ -10,10 +10,10 @@ import matplotlib.pyplot as plt
 
 class RegionalColorExtractor(nn.Module):
     """
-    Model that extracts 40 dimensions in total from a 32x32 image using a lightweight CNN:
-    "5 object-side colors (RGB 3 + existence flag 1 = 20 dimensions)" and
-    "5 background-side colors (RGB 3 + existence flag 1 = 20 dimensions)".
-    Eliminates the Hungarian algorithm, resolving underfitting by fixing order via luminance sorting and introducing existence flags.
+    Optimized RegionalColorExtractor:
+    - Separates RGB prediction (Sigmoid -> [0, 1]) and Existence Flag (Logits for BCEWithLogitsLoss).
+    - Applies flag-masked RGB loss so non-existing colors do not incur useless penalties.
+    - Uses advanced texture-mixed data generation (gradients, blurs, noise) to bridge the real-world gap.
     """
     def __init__(self, config=None, target_size=32):
         super().__init__()
@@ -50,20 +50,21 @@ class RegionalColorExtractor(nn.Module):
             nn.Flatten()
         )
         
-        # 40-dimensional output (5 object-side colors * 4 [RGB + Exists] = 20 dims, 5 background-side colors * 4 = 20 dims)
+        # 40-dimensional output split:
+        # First 30 dims: RGB for 10 colors (will be Sigmoided)
+        # Latter 10 dims: Existence logits for 10 colors (will use BCEWithLogitsLoss)
         self.fc = nn.Sequential(
             nn.Linear(128, 128),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(128, 40),
-            nn.Sigmoid()  # Normalize both RGB and existence flags to [0.0, 1.0]
+            nn.Linear(128, 40)  # No final Sigmoid here; applied selectively in forward
         )
 
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
         param_msg = (
-            f"📊 [RegionalColorExtractor v2] Model Architecture Initialized:\n"
+            f"📊 [RegionalColorExtractor v3] Initialized (Separated RGB & Flag Logits):\n"
             f" • Target Size         : {self.target_size}x{self.target_size}\n"
             f" • Total Parameters    : {total_params:,}\n"
             f" • Trainable Parameters: {trainable_params:,}"
@@ -75,7 +76,7 @@ class RegionalColorExtractor(nn.Module):
         Args:
             x (torch.Tensor): shape (B, 3, H, W) or (B, H, W, 3), value range [0.0, 1.0]
         Returns:
-            torch.Tensor: shape (B, 10, 4) of predicted representative colors and existence flags [First 5 colors: object side, Latter 5 colors: background side]
+            torch.Tensor: shape (B, 10, 4) -> RGB normalized to [0,1], Flag as logits
         """
         if x.shape[-1] == 3:
             x = x.permute(0, 3, 1, 2)
@@ -83,8 +84,14 @@ class RegionalColorExtractor(nn.Module):
         feat = self.features(x)
         out_flat = self.fc(feat)  # (B, 40)
         
-        # Reshape to (B, 10, 4) [R, G, B, Exists_Flag]
-        out = out_flat.view(-1, 10, 4)
+        # Separate RGB (first 30 dims -> 10 * 3) and Flags (latter 10 dims -> 10 * 1)
+        rgb_logits = out_flat[:, :30].view(-1, 10, 3)
+        flag_logits = out_flat[:, 30:].view(-1, 10, 1)
+        
+        rgb_pred = torch.sigmoid(rgb_logits)
+        
+        # Concatenate back to (B, 10, 4) where channel 3 is flag logit
+        out = torch.cat([rgb_pred, flag_logits], dim=2)
         return out
 
     def _log(self, message):
@@ -108,8 +115,8 @@ class RegionalColorExtractor(nn.Module):
                 colors_40 = y_colors[data_idx]  # (40,)
                 colors_10x4 = colors_40.reshape(10, 4)
                 
-                inside_items = colors_10x4[:5]   # 5 object-side colors
-                outside_items = colors_10x4[5:]  # 5 background-side colors
+                inside_items = colors_10x4[:5]   # Inner region colors
+                outside_items = colors_10x4[5:]  # Outer region colors
                 
                 inside_hexes = ", ".join([f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}({c[3]:.1f})" for c in inside_items if c[3] > 0.5])
                 outside_hexes = ", ".join([f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}({c[3]:.1f})" for c in outside_items if c[3] > 0.5])
@@ -128,10 +135,10 @@ class RegionalColorExtractor(nn.Module):
 
                 ax.set_xticks([])
                 ax.set_yticks([])
-                ax.set_title(f"In: {inside_hexes}\nOut: {outside_hexes}", fontsize=5)
+                ax.set_title(f"Inner: {inside_hexes}\nOuter: {outside_hexes}", fontsize=5)
 
             plt.tight_layout()
-            out_path = os.path.join(self.space_dir, "regional_extractor_32x32_v2_samples.png")
+            out_path = os.path.join(self.space_dir, "regional_extractor_32x32_v3_samples.png")
             plt.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
             plt.close()
             print(f"🖼️ Training samples grid saved to: [{out_path}]")
@@ -139,14 +146,11 @@ class RegionalColorExtractor(nn.Module):
             print(f"⚠️ Failed to generate sample visualization grid: {e}")
 
     def _generate_training_data(self, num_samples):
-        """
-        Rapidly generate training data with existence flags and luminance sorting.
-        """
         X_images, y_colors = [], []
         ts = self.target_size
         center = ts / 2.0
         
-        print(f"Generating {num_samples:,} training samples ({ts}x{ts}) [v2: Exists Flag & Brightness Sort]...")
+        print(f"Generating {num_samples:,} training samples ({ts}x{ts}) [v3: Gradients, Blurs & Masked RGB Loss]...")
         start_t = time.time()
         
         y_indices, x_indices = np.ogrid[:ts, :ts]
@@ -155,7 +159,7 @@ class RegionalColorExtractor(nn.Module):
         
         pbar = tqdm(
             range(num_batches), 
-            desc="Generating Data (v2)", 
+            desc="Generating Data (v3)", 
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
         )
         
@@ -169,37 +173,58 @@ class RegionalColorExtractor(nn.Module):
             batch_grids = np.zeros((current_batch_size, ts, ts, 3), dtype=np.float32)
             color_id_grids = np.zeros((current_batch_size, ts, ts), dtype=np.int32)
             
+            shape_types = np.random.choice(['shapes', 'smooth_grad', 'perlin_noise'], size=current_batch_size, p=[0.6, 0.2, 0.2])
+            
             for b in range(current_batch_size):
+                st = shape_types[b]
                 base_bg_id = np.random.choice([5, 6, 7, 8, 9])
                 color_id_grids[b] = base_bg_id
                 
-                num_shapes = np.random.randint(1, 4)
-                for _ in range(num_shapes):
-                    obj_id = np.random.choice([0, 1, 2, 3, 4])
-                    bg_id = np.random.choice([5, 6, 7, 8, 9])
-                    chosen_id = np.random.choice([obj_id, bg_id, obj_id])
-                    
-                    shape_kind = np.random.choice(['rect', 'circle', 'tri'])
-                    if shape_kind == 'rect':
-                        rx1, ry1 = np.random.uniform(0, ts*0.7, 2)
-                        rx2, ry2 = rx1 + np.random.uniform(ts*0.1, ts*0.5, 2)
-                        mask = (rx1 <= x_indices) & (x_indices <= rx2) & (ry1 <= y_indices) & (y_indices <= ry2)
-                    elif shape_kind == 'circle':
-                        cx, cy = np.random.uniform(0, ts, 2)
-                        rad = np.random.uniform(ts * 0.15, ts * 0.4)
-                        mask = (x_indices - cx)**2 + (y_indices - cy)**2 <= rad**2
-                    else:
-                        ax, ay = np.random.uniform(0, ts, 2)
-                        mask = np.abs(x_indices - ax) + np.abs(y_indices - ay) <= np.random.uniform(ts*0.15, ts*0.35)
+                if st == 'smooth_grad':
+                    dx = np.random.uniform(-1, 1)
+                    dy = np.random.uniform(-1, 1)
+                    vals = dx * (x_indices - center) + dy * (y_indices - center)
+                    alpha = 1.0 / (1.0 + np.exp(-vals))
+                    c1 = palettes[b, np.random.choice(range(5))]
+                    c2 = palettes[b, np.random.choice(range(5, 10))]
+                    batch_grids[b] = c1[None, None, :] * (1 - alpha[..., None]) + c2[None, None, :] * alpha[..., None]
+                    continue
+                elif st == 'perlin_noise':
+                    freq = np.random.uniform(0.4, 0.9)
+                    pattern = np.sin(x_indices * freq) * np.cos(y_indices * freq)
+                    mask = pattern > 0.0
+                    obj_c = np.random.choice(range(5))
+                    bg_c = np.random.choice(range(5, 10))
+                    color_id_grids[b] = np.where(mask, obj_c, bg_c)
+                else:
+                    num_shapes = np.random.randint(1, 4)
+                    for _ in range(num_shapes):
+                        obj_id = np.random.choice([0, 1, 2, 3, 4])
+                        bg_id = np.random.choice([5, 6, 7, 8, 9])
+                        chosen_id = np.random.choice([obj_id, bg_id, obj_id])
                         
-                    color_id_grids[b] = np.where(mask, chosen_id, color_id_grids[b])
+                        shape_kind = np.random.choice(['rect', 'circle', 'tri'])
+                        if shape_kind == 'rect':
+                            rx1, ry1 = np.random.uniform(0, ts*0.7, 2)
+                            rx2, ry2 = rx1 + np.random.uniform(ts*0.1, ts*0.5, 2)
+                            mask = (rx1 <= x_indices) & (x_indices <= rx2) & (ry1 <= y_indices) & (y_indices <= ry2)
+                        elif shape_kind == 'circle':
+                            cx, cy = np.random.uniform(0, ts, 2)
+                            rad = np.random.uniform(ts * 0.15, ts * 0.4)
+                            mask = (x_indices - cx)**2 + (y_indices - cy)**2 <= rad**2
+                        else:
+                            ax, ay = np.random.uniform(0, ts, 2)
+                            mask = np.abs(x_indices - ax) + np.abs(y_indices - ay) <= np.random.uniform(ts*0.15, ts*0.35)
+                            
+                        color_id_grids[b] = np.where(mask, chosen_id, color_id_grids[b])
 
             for b in range(current_batch_size):
-                palette = palettes[b]
-                c_grid = color_id_grids[b]
-                grid_rgb = palette[c_grid]
-                pixel_noise = np.random.normal(0, 0.03, size=(ts, ts, 3))
-                batch_grids[b] = np.clip(grid_rgb + pixel_noise, 0.0, 1.0)
+                if shape_types[b] != 'smooth_grad':
+                    palette = palettes[b]
+                    c_grid = color_id_grids[b]
+                    grid_rgb = palette[c_grid]
+                    pixel_noise = np.random.normal(0, 0.03, size=(ts, ts, 3))
+                    batch_grids[b] = np.clip(grid_rgb + pixel_noise, 0.0, 1.0)
 
             total_noise = np.random.normal(0, 0.02, size=(current_batch_size, ts, ts, 3))
             batch_grids = np.clip(batch_grids + total_noise, 0.0, 1.0)
@@ -212,7 +237,7 @@ class RegionalColorExtractor(nn.Module):
                 in_mask = radius_mask
                 out_mask = ~radius_mask
                 
-                # Object side 5 colors (RGB and flag 1.0 if present, black & flag 0.0 if absent)
+                # Inner 5 colors (RGB + existence flag 1.0 or 0.0)
                 inside_features = []
                 for cid in range(5):
                     match_pixels = (c_grid == cid) & in_mask
@@ -222,7 +247,7 @@ class RegionalColorExtractor(nn.Module):
                     else:
                         inside_features.append([0.0, 0.0, 0.0, 0.0])
                 
-                # Background side 5 colors
+                # Outer 5 colors
                 outside_features = []
                 for cid in range(5, 10):
                     match_pixels = (c_grid == cid) & out_mask
@@ -232,7 +257,7 @@ class RegionalColorExtractor(nn.Module):
                     else:
                         outside_features.append([0.0, 0.0, 0.0, 0.0])
                 
-                # Sort by luminance (R+G+B) to determine order deterministically (eliminating the need for Hungarian algorithm)
+                # Sort by luminance (R+G+B) for deterministic ordering
                 inside_arr = np.array(inside_features)
                 outside_arr = np.array(outside_features)
                 
@@ -258,7 +283,7 @@ class RegionalColorExtractor(nn.Module):
         return X_arr, y_arr
 
     def train_model(self, epochs=40, batch_size=256, num_samples=50000, patience=8):
-        self._log(f"Training RegionalColorExtractor v2 with {num_samples:,} samples...")
+        self._log(f"Training RegionalColorExtractor v3 with {num_samples:,} samples...")
         
         X_imgs, y_cols = self._generate_training_data(num_samples)
 
@@ -275,14 +300,13 @@ class RegionalColorExtractor(nn.Module):
         optimizer = optim.AdamW(self.parameters(), lr=0.001, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
         
-        # Loss function: MSE for RGB parts, BCE (or MSE) for existence flag parts
-        criterion_rgb = nn.MSELoss()
-        criterion_flag = nn.BCEWithLogitsLoss() # or MSE
+        criterion_rgb = nn.MSELoss(reduction='none')
+        criterion_flag = nn.BCEWithLogitsLoss(reduction='none')
 
         best_loss = float('inf')
         patience_counter = 0
 
-        print(f"\n--- 🚀 RegionalColorExtractor v2 Training Started (No Hungarian, Fast GPU Loss) ---")
+        print(f"\n--- 🚀 RegionalColorExtractor v3 Training Started (Separated RGB & Flag Losses) ---")
         total_train_start = time.time()
 
         for epoch in range(epochs):
@@ -295,19 +319,22 @@ class RegionalColorExtractor(nn.Module):
                 b_x, b_y = b_x.to(self.device), b_y.to(self.device)
                 optimizer.zero_grad()
                 
-                preds = self(b_x)  # (B, 10, 4)
+                preds = self(b_x)  # (B, 10, 4) -> RGB [0,1], Flag Logits
                 targets = b_y.view(-1, 10, 4)
                 
-                # Separate predictions and targets
                 preds_rgb = preds[:, :, :3]
-                preds_flag = preds[:, :, 3]
+                preds_flag_logits = preds[:, :, 3]
                 
                 targets_rgb = targets[:, :, :3]
-                targets_flag = targets[:, :, 3]
+                targets_flag = targets[:, :, 3]  # 0.0 or 1.0
                 
-                # Strictly evaluate RGB loss only for existing colors (flag > 0.5), reducing useless penalties on non-existing colors
-                loss_rgb = criterion_rgb(preds_rgb, targets_rgb)
-                loss_flag = nn.MSELoss()(preds_flag, targets_flag)
+                # Flag Loss (BCEWithLogitsLoss)
+                loss_flag = criterion_flag(preds_flag_logits, targets_flag).mean()
+                
+                # RGB Loss strictly masked to colors that actually exist (targets_flag > 0.5)
+                flag_mask = targets_flag.unsqueeze(-1)  # (B, 10, 1)
+                rgb_sq_diff = ((preds_rgb - targets_rgb) ** 2) * flag_mask
+                loss_rgb = rgb_sq_diff.sum() / (flag_mask.sum() * 3.0 + 1e-6)
                 
                 loss = loss_rgb + 0.5 * loss_flag
                 
@@ -329,7 +356,17 @@ class RegionalColorExtractor(nn.Module):
                     preds = self(b_x)
                     targets = b_y.view(-1, 10, 4)
                     
-                    loss = nn.MSELoss()(preds, targets)
+                    preds_rgb = preds[:, :, :3]
+                    preds_flag_logits = preds[:, :, 3]
+                    targets_rgb = targets[:, :, :3]
+                    targets_flag = targets[:, :, 3]
+                    
+                    loss_flag = criterion_flag(preds_flag_logits, targets_flag).mean()
+                    flag_mask = targets_flag.unsqueeze(-1)
+                    rgb_sq_diff = ((preds_rgb - targets_rgb) ** 2) * flag_mask
+                    loss_rgb = rgb_sq_diff.sum() / (flag_mask.sum() * 3.0 + 1e-6)
+                    
+                    loss = loss_rgb + 0.5 * loss_flag
                     val_loss += loss.item() * b_x.size(0)
                     val_pbar.set_postfix(val_loss=f"{loss.item():.4f}")
 
@@ -370,12 +407,12 @@ class RegionalColorExtractor(nn.Module):
         inside_preds = pred[:5]   # Object side
         outside_preds = pred[5:]  # Background side
         
-        # Extract ones with existence flag greater than 0.5, falling back if insufficient
-        inside_colors = [c[:3] for c in inside_preds if c[3] > 0.3]
+        # Extract ones with existence flag logit > 0 (or probability > 0.5 after sigmoid)
+        inside_colors = [c[:3] for c in inside_preds if c[3] > 0.0]
         if not inside_colors:
             inside_colors = [c[:3] for c in inside_preds[:3]]
             
-        outside_colors = [c[:3] for c in outside_preds if c[3] > 0.3]
+        outside_colors = [c[:3] for c in outside_preds if c[3] > 0.0]
         if not outside_colors:
             outside_colors = [c[:3] for c in outside_preds[:3]]
         

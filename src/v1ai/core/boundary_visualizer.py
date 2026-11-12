@@ -6,23 +6,18 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from PIL import Image
 import cv2
+from tqdm import tqdm
 
 class BoundaryVisualizer:
-    """
-    3-Row 5-Col + 4th Row Integrated Layout:
-      - Row 1: Original image in top-left, with processing descriptions for each column in the remaining empty spaces.
-      - Row 2: Boundary extraction using BoundaryFilter (5 patterns: Full Screen, Top-Right, Top-Left, Bottom-Right, Bottom-Left).
-      - Row 3: Object extraction using ObjectExtractorFilter (using 5 object colors and 5 background colors from each designated region).
-      - Row 4: "Common Boundary Master Image" displayed in the bottom-left, showing only the boundaries present across all 5 boundary maps (AND intersection).
-    """
-    
     def __init__(self, config, patch_size=9, max_image_size=1028):
         self.config = config
         self.device = getattr(config, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        print(f"🚀 [BoundaryVisualizer] Using device: {self.device}")
+        
         self.patch_size = getattr(config, "patch_size", patch_size)
-        self.max_border_colors = 10  # For boundary queries (5 object + 5 background)
-        self.max_object_colors = 5   # For object queries
-        self.max_bg_colors = 5       # For background queries
+        self.max_border_colors = 10
+        self.max_object_colors = 5
+        self.max_bg_colors = 5
         self.max_image_size = max_image_size
         
         self.retention_percent = float(getattr(
@@ -30,9 +25,6 @@ class BoundaryVisualizer:
             "boundary_retention_percent", 
             getattr(config, "boundary_retention_percent", 20.0)
         ))
-        
-        print(f"⚙️ [BoundaryVisualizer] Target Boundary Retention: Top {self.retention_percent}% | Max Image Size: {self.max_image_size}px")
-        print(f"🖥️ Target Device: {self.device}")
         
         self.space_dir = getattr(config, "space_dir", "./")
         self.model_dir = os.path.join(self.space_dir, "models")
@@ -43,6 +35,7 @@ class BoundaryVisualizer:
         self.color_model_path = os.path.join(self.model_dir, "regional_color_extractor.pth")
         
     def _load_models(self):
+        print("📂 Loading models onto device...")
         t_load_start = time.time()
         if not os.path.exists(self.boundary_model_path):
             raise FileNotFoundError(f"⚠️ BoundaryFilter model not found at [{self.boundary_model_path}].")
@@ -73,7 +66,6 @@ class BoundaryVisualizer:
             extractor_model.load_state_dict(torch.load(self.extractor_model_path, map_location=self.device))
         extractor_model.eval()
         
-        # Load with target_size=32 to match the 32x32 specification
         color_model = RegionalColorExtractor(target_size=32).to(self.device)
         try:
             color_model.load_state_dict(torch.load(self.color_model_path, map_location=self.device, weights_only=True))
@@ -81,7 +73,7 @@ class BoundaryVisualizer:
             color_model.load_state_dict(torch.load(self.color_model_path, map_location=self.device))
         color_model.eval()
 
-        print(f"⏱️ [Model Loading] All models loaded successfully in {time.time() - t_load_start:.3f}s")
+        print(f"✅ Models loaded successfully in {time.time() - t_load_start:.2f}s")
         return boundary_model, extractor_model, color_model
 
     def _resize_if_needed(self, pil_img):
@@ -93,14 +85,11 @@ class BoundaryVisualizer:
             else:
                 new_h = self.max_image_size
                 new_w = int(w * (self.max_image_size / h))
-            print(f"🔄 Resizing large image from ({w}x{h}) to ({new_w}x{new_h})")
+            print(f"🖼️ Resizing image from ({w}x{h}) to ({new_w}x{new_h}) for performance.")
             return pil_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
         return pil_img
 
     def _extract_crop_by_mode(self, pil_img, mode):
-        """
-        Crop or resize the image based on the specified regional mode.
-        """
         W, H = pil_img.size
         cw = int(W * 0.3)
         ch = int(H * 0.3)
@@ -108,34 +97,23 @@ class BoundaryVisualizer:
         if mode == 'full':
             return pil_img
         elif mode == 'top-right':
-            return pil_img.crop((W - cw, 0, W, ch))     # Top-Right corner
+            return pil_img.crop((W - cw, 0, W, ch))
         elif mode == 'top-left':
-            return pil_img.crop((0, 0, cw, ch))         # Top-Left corner
+            return pil_img.crop((0, 0, cw, ch))
         elif mode == 'bottom-right':
-            return pil_img.crop((W - cw, H - ch, W, H)) # Bottom-Right corner
+            return pil_img.crop((W - cw, H - ch, W, H))
         elif mode == 'bottom-left':
-            return pil_img.crop((0, H - ch, cw, H))     # Bottom-Left corner
+            return pil_img.crop((0, H - ch, cw, H))
         return pil_img
 
     def _get_colors(self, pil_img, color_model, mode):
-        """
-        Extract 5 object colors and 5 background colors using RegionalColorExtractor 
-        from the specified region crop.
-        """
-        t_start = time.time()
         crop_img = self._extract_crop_by_mode(pil_img, mode)
-        
         res = color_model.extract_colors_from_pil(crop_img, device=self.device)
         obj_colors = res.get("group_1_inside_circle", {}).get("colors", [])[:5]
         bg_colors = res.get("group_2_outside_circle", {}).get("colors", [])[:5]
-                
-        elapsed = time.time() - t_start
-        print(f"     ⏱️ [Color Extractor ({mode})] Time: {elapsed:.3f}s (Obj: {len(obj_colors)}, BG: {len(bg_colors)})")
-        
         return obj_colors, bg_colors
 
-    def _infer_boundary_map(self, pil_img, boundary_model, border_colors_list):
-        t_start = time.time()
+    def _infer_boundary_map(self, pil_img, boundary_model, border_colors_list, desc="Boundary"):
         W, H = pil_img.size
         tensor_img = torch.tensor(np.array(pil_img, dtype=np.float32) / 255.0, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(self.device)
         
@@ -147,10 +125,11 @@ class BoundaryVisualizer:
         L = patches_raw.shape[2]
         patches_tensor = patches_raw.view(1, 3, ps, ps, L).permute(0, 4, 1, 2, 3).squeeze(0)
 
-        query_vector = np.zeros(self.max_border_colors * 3, dtype=np.float32)
+        query_vector = np.zeros(self.max_border_colors * 4, dtype=np.float32)
         limited_colors = border_colors_list[:self.max_border_colors]
-        flat_qc = np.concatenate(limited_colors) if len(limited_colors) > 0 else np.zeros(3)
-        query_vector[:len(flat_qc)] = flat_qc
+        for idx, c in enumerate(limited_colors):
+            query_vector[idx * 4 : idx * 4 + 3] = c
+            query_vector[idx * 4 + 3] = 1.0
 
         q_tensor = torch.tensor(query_vector, dtype=torch.float32, device=self.device).unsqueeze(0).repeat(L, 1)
 
@@ -164,7 +143,7 @@ class BoundaryVisualizer:
                 b_queries = q_tensor[i:i+batch_size].to(self.device)
                 
                 preds = boundary_model(b_patches, b_queries)
-                edge_prob = torch.sigmoid(preds[:, 0:1])
+                edge_prob = preds[:, 0:1]
                 rgb_pred = preds[:, 1:]
                 
                 all_edge_probs.append(edge_prob)
@@ -182,16 +161,13 @@ class BoundaryVisualizer:
         confidence_map = edge_tensor.view(H, W).detach().cpu().numpy()
         color_map = rgb_tensor.view(H, W, 3).detach().cpu().numpy()
         
-        elapsed = time.time() - t_start
-        print(f"     ⏱️ [BoundaryFilter Inference] Time: {elapsed:.3f}s (Patches: {L:,})")
         return confidence_map, color_map, dynamic_threshold
 
     def _infer_object_extractor_map(self, pil_img, boundary_model, extractor_model, obj_colors_list, bg_colors_list):
-        t_start = time.time()
         W, H = pil_img.size
         
         border_colors_full = obj_colors_list + bg_colors_list
-        confidence_map, color_map, dyn_thresh = self._infer_boundary_map(pil_img, boundary_model, border_colors_full)
+        confidence_map, color_map, dyn_thresh = self._infer_boundary_map(pil_img, boundary_model, border_colors_full, desc="Obj-Boundary")
         edge_mask = (confidence_map >= dyn_thresh)
 
         tensor_img = torch.tensor(np.array(pil_img, dtype=np.float32) / 255.0, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(self.device)
@@ -203,16 +179,18 @@ class BoundaryVisualizer:
         L = patches_raw.shape[2]
         patches_tensor = patches_raw.view(1, 3, ps, ps, L).permute(0, 4, 1, 2, 3).squeeze(0)
 
-        obj_vector = np.zeros(self.max_object_colors * 3, dtype=np.float32)
+        obj_vector = np.zeros(self.max_object_colors * 4, dtype=np.float32)
         limited_obj = obj_colors_list[:self.max_object_colors]
-        flat_oc = np.concatenate(limited_obj) if len(limited_obj) > 0 else np.zeros(3)
-        obj_vector[:len(flat_oc)] = flat_oc
+        for idx, c in enumerate(limited_obj):
+            obj_vector[idx*4 : idx*4+3] = c
+            obj_vector[idx*4+3] = 1.0
         obj_q_tensor = torch.tensor(obj_vector, dtype=torch.float32, device=self.device).unsqueeze(0).repeat(L, 1)
 
-        bg_vector = np.zeros(self.max_bg_colors * 3, dtype=np.float32)
+        bg_vector = np.zeros(self.max_bg_colors * 4, dtype=np.float32)
         limited_bg = bg_colors_list[:self.max_bg_colors]
-        flat_bg = np.concatenate(limited_bg) if len(limited_bg) > 0 else np.zeros(3)
-        bg_vector[:len(flat_bg)] = flat_bg
+        for idx, c in enumerate(limited_bg):
+            bg_vector[idx*4 : idx*4+3] = c
+            bg_vector[idx*4+3] = 1.0
         bg_q_tensor = torch.tensor(bg_vector, dtype=torch.float32, device=self.device).unsqueeze(0).repeat(L, 1)
 
         batch_size = 4096
@@ -225,7 +203,27 @@ class BoundaryVisualizer:
                 b_obj_q = obj_q_tensor[i:i+batch_size].to(self.device)
                 b_bg_q = bg_q_tensor[i:i+batch_size].to(self.device)
                 
-                preds = extractor_model(b_patches, b_obj_q, b_bg_q)
+                center_idx = ps // 2
+                center_colors = b_patches[:, :, center_idx, center_idx]
+                center_expanded = center_colors.unsqueeze(1)
+                
+                obj_rgb_list = [b_obj_q[:, idx*4:idx*4+3] for idx in range(5)]
+                bg_rgb_list = [b_bg_q[:, idx*4:idx*4+3] for idx in range(5)]
+                
+                obj_palettes = torch.stack(obj_rgb_list, dim=1)
+                bg_palettes = torch.stack(bg_rgb_list, dim=1)
+                
+                obj_dists = torch.norm(center_expanded - obj_palettes, dim=-1)
+                bg_dists = torch.norm(center_expanded - bg_palettes, dim=-1)
+                
+                obj_min_dist = torch.min(obj_dists, dim=-1, keepdim=True)[0]
+                obj_mean_dist = torch.mean(obj_dists, dim=-1, keepdim=True)
+                bg_min_dist = torch.min(bg_dists, dim=-1, keepdim=True)[0]
+                bg_mean_dist = torch.mean(bg_dists, dim=-1, keepdim=True)
+                
+                b_dist = torch.cat([obj_min_dist, obj_mean_dist, bg_min_dist, bg_mean_dist], dim=1)
+                
+                preds = extractor_model(b_patches, b_obj_q, b_bg_q, b_dist)
                 is_bg_logit = preds[:, 0:1]
                 all_is_bg_logits.append(is_bg_logit)
                 
@@ -234,35 +232,21 @@ class BoundaryVisualizer:
         
         is_background = (bg_probs > 0.5) & (~edge_mask)
         object_mask = ~is_background
-        
-        elapsed = time.time() - t_start
-        print(f"     ⏱️ [ObjectExtractorFilter Inference] Time: {elapsed:.3f}s")
         return object_mask
 
     def _compute_common_boundary_master_image(self, img_np, all_boundary_display_maps):
-        t_start = time.time()
-        
-        base_bg_color = np.array([0.88, 0.97, 0.98])
+        base_bg_color = np.array([0.96, 0.98, 0.99])
         intersect_mask = np.ones(img_np.shape[:2], dtype=bool)
         
         for disp_map in all_boundary_display_maps:
-            # Extract boundary portions (pixels deviating from the background color)
             diff = np.sqrt(np.sum((disp_map - base_bg_color)**2, axis=2))
-            is_edge = diff > 0.04  # Fine-tune the decision sensitivity
+            is_edge = diff > 0.04 
             intersect_mask = intersect_mask & is_edge
             
-        # Render the 4th row master image clearly (white background, enhance common boundary lines with black or original image color)
-        common_boundary_img = np.ones_like(img_np) * 1.0  # Default white background
-        
-        # Morphological operations or similar processing to make lines slightly thicker/darker (optional)
+        common_boundary_img = np.ones_like(img_np) * 1.0  
         kernel = np.ones((3, 3), np.uint8)
         thick_intersect_mask = cv2.dilate(intersect_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-        
-        # Draw background as white (1.0), and boundary lines darker using original image color (or close to black)
-        common_boundary_img[thick_intersect_mask] = img_np[thick_intersect_mask] * 0.2  # Emphasize darker (dimmer)
-        
-        elapsed = time.time() - t_start
-        print(f"     ⏱️ [Common Boundary Intersection] Time: {elapsed:.3f}s")
+        common_boundary_img[thick_intersect_mask] = img_np[thick_intersect_mask] * 0.2  
         return common_boundary_img
 
     def visualize_sample_images(self):
@@ -285,30 +269,24 @@ class BoundaryVisualizer:
         output_dir = os.path.join(self.space_dir, "boundary_filtered_results")
         os.makedirs(output_dir, exist_ok=True)
 
-        print(f"\n--- 🚀 4-Row 5-Col Pipeline Visualization Started ---")
+        print(f"\n--- 🚀 4-Row 5-Col Pipeline Visualization Started ({len(image_files)} images found) ---")
+        
         for filename in image_files:
-            t_file_start = time.time()
-            print(f"\nProcessing file: {filename}")
+            print(f"\n📸 Processing image: [{filename}]")
+            t_img_start = time.time()
             
             img_path = os.path.join(sample_dir, filename)
             raw_pil_img = Image.open(img_path).convert("RGB")
             pil_img = self._resize_if_needed(raw_pil_img)
             img_np = np.array(pil_img, dtype=np.float32) / 255.0
 
-            # Column modes for extraction (1 to 5 columns)
             col_modes = ['full', 'top-right', 'top-left', 'bottom-right', 'bottom-left']
-            
             col_descriptions = [
-                "[Col 1: Full Screen]\n"
-                "- Extract 5 object & 5 BG colors from full image to extract boundaries and objects.",
-                "[Col 2: Top-Right Corner]\n"
-                "- Extract 5 object & 5 BG colors from top-right corner to extract boundaries and objects.",
-                "[Col 3: Top-Left Corner]\n"
-                "- Extract 5 object & 5 BG colors from top-left corner to extract boundaries and objects.",
-                "[Col 4: Bottom-Right Corner]\n"
-                "- Extract 5 object & 5 BG colors from bottom-right corner to extract boundaries and objects.",
-                "[Col 5: Bottom-Left Corner]\n"
-                "- Extract 5 object & 5 BG colors from bottom-left corner to extract boundaries and objects."
+                "[Col 1: Full Screen]\n- Extract 5 object & 5 BG colors from full image.",
+                "[Col 2: Top-Right Corner]\n- Extract 5 object & 5 BG colors from top-right corner.",
+                "[Col 3: Top-Left Corner]\n- Extract 5 object & 5 BG colors from top-left corner.",
+                "[Col 4: Bottom-Right Corner]\n- Extract 5 object & 5 BG colors from bottom-right corner.",
+                "[Col 5: Bottom-Left Corner]\n- Extract 5 object & 5 BG colors from bottom-left corner."
             ]
 
             fig, axes = plt.subplots(4, 5, figsize=(25, 20))
@@ -327,29 +305,35 @@ class BoundaryVisualizer:
             all_boundary_display_maps = []
 
             for col_idx, mode in enumerate(col_modes):
-                print(f"    --- Column {col_idx+1}: Mode [{mode}] ---")
-                
-                # Retrieve 5 object colors and 5 background colors using RegionalColorExtractor for each region
+                t_mode_start = time.time()
+                print(f"  👉 Processing Column {col_idx+1}/5 [Mode: {mode}]...")
+
                 obj_cols, bg_cols = self._get_colors(pil_img, color_model, mode=mode)
                 border_cols_full = obj_cols + bg_cols
 
-                # --- Row 2: BoundaryFilter ---
+                # 1. Boundary Map Inference
                 conf_map, col_map, dyn_thresh = self._infer_boundary_map(pil_img, boundary_model, border_cols_full)
                 
-                display_map = np.ones((*conf_map.shape, 3), dtype=np.float32)
-                base_bg_color = np.array([0.88, 0.97, 0.98])
+                # 背景色をより薄く設定 (非常に明るい薄い青/白み)
+                base_bg_color = np.array([0.96, 0.98, 0.99], dtype=np.float32)
+                display_map = np.ones((*conf_map.shape, 3), dtype=np.float32) * base_bg_color[None, None, :]
+
+                # 閾値以上のエッジマスクを作成し、膨張（dilate）で線を太くする
+                edge_mask = (conf_map >= dyn_thresh).astype(np.uint8)
+                kernel = np.ones((3, 3), np.uint8)
+                thick_edge_mask = cv2.dilate(edge_mask, kernel, iterations=1) > 0
+
+                # スコアによる輝度の変化を入れつつ、明るめでくっきりした（濃い）表示に調整
+                score_adjusted = np.clip(conf_map * 1.2 + 0.2, 0.0, 1.0)
+
+                # ベクトル演算による高速一括描画
                 for c in range(3):
-                    display_map[:, :, c] = base_bg_color[c]
+                    channel_bg = base_bg_color[c]
+                    channel_fg = col_map[:, :, c]
+                    val = channel_fg * score_adjusted + channel_bg * (1.0 - score_adjusted)
+                    display_map[:, :, c] = np.where(thick_edge_mask, val, channel_bg)
 
-                edge_mask = (conf_map >= dyn_thresh)
-                for y in range(conf_map.shape[0]):
-                    for x in range(conf_map.shape[1]):
-                        if edge_mask[y, x]:
-                            score = conf_map[y, x]
-                            pred_rgb = col_map[y, x]
-                            adj_col = pred_rgb * score + base_bg_color * (1.0 - score)
-                            display_map[y, x, :] = np.clip(adj_col, 0.0, 1.0)
-
+                display_map = np.clip(display_map, 0.0, 1.0)
                 all_boundary_display_maps.append(display_map)
 
                 ax_b = axes[1, col_idx]
@@ -362,7 +346,7 @@ class BoundaryVisualizer:
                           ha='center', va='top', fontsize=6, fontweight='bold',
                           bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='gray'))
 
-                # --- Row 3: ObjectExtractorFilter ---
+                # 2. Object Extractor Inference
                 object_mask = self._infer_object_extractor_map(
                     pil_img, boundary_model, extractor_model, obj_cols, bg_cols
                 )
@@ -379,8 +363,9 @@ class BoundaryVisualizer:
                 ax_e.text(0.5, -0.12, f"BG Colors:\n{bg_hex_str}", transform=ax_e.transAxes,
                           ha='center', va='top', fontsize=6, fontweight='bold',
                           bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='gray'))
+                
+                print(f"     ✅ Mode [{mode}] finished in {time.time() - t_mode_start:.2f}s")
 
-            # --- Row 4: Common Boundary Master Image ---
             common_boundary_master = self._compute_common_boundary_master_image(img_np, all_boundary_display_maps)
 
             ax_m = axes[3, 0]
@@ -401,7 +386,6 @@ class BoundaryVisualizer:
             out_path = os.path.join(output_dir, f"pipeline_4row_5col_grid_{filename}")
             plt.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
             plt.close()
+            print(f"  🎉 Finished [{filename}] in {time.time() - t_img_start:.2f}s. Saved to {out_path}")
 
-            print(f"✅ Processed [{filename}] total file time: {time.time() - t_file_start:.3f}s")
-
-        print(f"\n📂 Results saved to: [{output_dir}]\n")
+        print(f"\n📂 All results saved to: [{output_dir}]\n")

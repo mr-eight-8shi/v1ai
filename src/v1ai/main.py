@@ -36,7 +36,7 @@ def action_runner():
 @action_runner()
 def run_train_color(config):
     """[Option 1] Train RegionalColorExtractor (Inside/Outside 10-Color)."""
-    target_size = 64
+    target_size = 32
     
     color_model = RegionalColorExtractor(config, target_size=target_size)
     print(f"--- [Training] RegionalColorExtractor ({target_size}x{target_size}) ---")
@@ -50,7 +50,7 @@ def run_train_boundary(config):
     
     filter_model = BoundaryFilter(config)
     print(f"--- [Training] BoundaryFilter ({patch_size}x{patch_size}) ---")
-    filter_model.train_model(epochs=20, num_samples=400000, patience=5)
+    filter_model.train_model(epochs=20, num_samples=200000, patience=5)
 
 
 @action_runner()

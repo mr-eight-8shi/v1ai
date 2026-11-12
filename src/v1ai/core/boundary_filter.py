@@ -10,14 +10,14 @@ import matplotlib.pyplot as plt
 
 class BoundaryFilter(nn.Module):
     """
-    Multi-task MLP model predicting a total of 4 dimensions:
-    "Presence of boundary (1D)" and "Line color RGB (3D)".
-    Supports variable colors from 2 to 10 (zero-padded to a fixed 30-dimensional vector for max 10 colors).
+    Query-driven Multi-task MLP model predicting a total of 4 dimensions:
+    "Presence of boundary (1D continuous confidence)" and "Line color RGB (3D)".
+    Supports up to 10 colors, structured with brightness-sorted [R, G, B, flag] x 10 = 40 dimensions.
     """
     def __init__(self, config=None, patch_size=9, max_query_colors=10):
         super().__init__()
         self.patch_size = patch_size
-        self.max_query_colors = max_query_colors  # Max 10 colors (fixed 30 dimensions)
+        self.max_query_colors = max_query_colors  # Max 10 colors
         
         if config is not None:
             self.patch_size = getattr(config, "patch_size", patch_size)
@@ -38,9 +38,9 @@ class BoundaryFilter(nn.Module):
         suffix = f"_{self.patch_size}x{self.patch_size}" if self.patch_size != 9 else ""
         self.model_path = os.path.join(self.model_dir, f"boundary_confidence_classifier{suffix}.pth")
 
-        # MLP network structure (changed output dimension to 4: 1D edge presence + 3D RGB color)
+        # MLP network structure: patch + query (40 dimensions: [R, G, B, flag] x 10)
         patch_dim = self.patch_size * self.patch_size * 3
-        query_color_dim = self.max_query_colors * 3  # 30 dimensions
+        query_color_dim = self.max_query_colors * 4  # 40 dimensions
         input_dim = patch_dim + query_color_dim
         
         self.net = nn.Sequential(
@@ -57,17 +57,17 @@ class BoundaryFilter(nn.Module):
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(256, 4)  # Output: [is_edge (logit), R, G, B]
+            nn.Linear(256, 4)  # Output: [is_edge (logit/sigmoided), R, G, B]
         )
 
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
         param_msg = (
-            f"📊 [BoundaryFilter] Model Architecture Initialized (Multi-task 4D Output Mode):\n"
+            f"📊 [BoundaryFilter] Model Architecture Initialized (Optimized 4D Output Mode):\n"
             f" • Patch Size          : {self.patch_size}x{self.patch_size}\n"
-            f" • Input Dimension     : {input_dim}\n"
-            f" • Output Dimension    : 4 [Edge Logit, R, G, B]\n"
+            f" • Input Dimension     : {input_dim} (Patch: {patch_dim} + Query 40dim)\n"
+            f" • Output Dimension    : 4 [Edge Score, R, G, B]\n"
             f" • Total Parameters    : {total_params:,}\n"
             f" • Trainable Parameters: {trainable_params:,}"
         )
@@ -77,19 +77,19 @@ class BoundaryFilter(nn.Module):
         """
         Args:
             patch_x: (B, 3, ps, ps)
-            query_colors: (B, 30) (RGB vectors for up to 10 colors, missing parts zero-padded)
+            query_colors: (B, 40) ([R, G, B, flag] vectors for up to 10 colors, brightness sorted)
         Returns:
-            torch.Tensor: (B, 4) -> [0]: Edge decision logit, [1:4]: RGB predicted values
+            torch.Tensor: (B, 4) -> [0]: Edge confidence [0, 1], [1:4]: RGB predicted values [0, 1]
         """
         b_size = patch_x.size(0)
         flat_patch = patch_x.view(b_size, -1)
         combined = torch.cat([flat_patch, query_colors], dim=1)
         out = self.net(combined)
         
-        # Keep edge part as logits, normalize RGB part to [0, 1] using Sigmoid
-        edge_logit = out[:, 0:1]
+        # Normalize edge score and RGB to [0, 1] using Sigmoid
+        edge_score = torch.sigmoid(out[:, 0:1])
         rgb_pred = torch.sigmoid(out[:, 1:])
-        return torch.cat([edge_logit, rgb_pred], dim=1)
+        return torch.cat([edge_score, rgb_pred], dim=1)
 
     def _log(self, message):
         if self.logger:
@@ -109,23 +109,15 @@ class BoundaryFilter(nn.Module):
                 patch = np.transpose(X_patches[data_idx], (1, 2, 0))
                 patch = np.clip(patch, 0.0, 1.0)
                 
-                query = X_queries[data_idx]
                 label = y_data[data_idx][0]
                 target_rgb = y_data[data_idx][1:4]
-                
-                colors_in_query = []
-                for c_i in range(self.max_query_colors):
-                    rgb = query[c_i*3:(c_i+1)*3]
-                    if np.sum(rgb) > 0.001:
-                        colors_in_query.append(rgb)
 
                 ax.imshow(patch, interpolation='nearest')
                 ax.set_xticks([])
                 ax.set_yticks([])
                 
-                status_str = "TRUE" if label > 0.5 else "FALSE"
                 rgb_hex = f"#{int(target_rgb[0]*255):02x}{int(target_rgb[1]*255):02x}{int(target_rgb[2]*255):02x}"
-                ax.set_title(f"[{status_str}] LineRGB: {rgb_hex}", fontsize=7)
+                ax.set_title(f"[EdgeScore: {label:.2f}] RGB: {rgb_hex}", fontsize=7)
 
             plt.tight_layout()
             out_path = os.path.join(self.space_dir, "training_samples_visualization.png")
@@ -140,7 +132,7 @@ class BoundaryFilter(nn.Module):
         ps = self.patch_size
         center_idx = ps // 2
         
-        print(f"Generating {num_samples:,} training samples (4D Output: Edge + RGB, Vectorized)...")
+        print(f"Generating {num_samples:,} training samples (Optimized Soft-Edge & Brightness-Sorted Query)...")
         start_t = time.time()
         
         y_indices, x_indices = np.ogrid[:ps, :ps]
@@ -159,8 +151,7 @@ class BoundaryFilter(nn.Module):
             current_batch_size = min(batch_gen_size, num_samples - b_idx * batch_gen_size)
             
             palettes = np.random.uniform(0.0, 1.0, size=(current_batch_size, self.num_palette_colors, 3))
-            shape_types = np.random.choice(['line', 'circle', 'rect', 'multi'], size=current_batch_size, p=[0.3, 0.2, 0.2, 0.3])
-            color_id_grids = np.zeros((current_batch_size, ps, ps), dtype=np.int32)
+            shape_types = np.random.choice(['line', 'circle', 'rect', 'multi', 'smooth_grad'], size=current_batch_size, p=[0.25, 0.2, 0.2, 0.2, 0.15])
             
             num_useds = np.random.choice([2, 3, 4, 5], size=current_batch_size)
             noise_prob = 0.05
@@ -170,6 +161,7 @@ class BoundaryFilter(nn.Module):
                 used_colors = np.random.choice(self.num_palette_colors, size=num_used, replace=False)
                 st = shape_types[b]
                 
+                # Default grid generation
                 if st == 'line':
                     theta = np.random.uniform(0, 2 * np.pi)
                     nx, ny = np.cos(theta), np.sin(theta)
@@ -178,119 +170,98 @@ class BoundaryFilter(nn.Module):
                     offset = np.random.uniform(-0.6, 0.6)
                     
                     vals = dx * (x_indices - center_idx) + dy * (y_indices - center_idx) + offset
-                    c_ids = np.where(vals >= 0, used_colors[1 % num_used], used_colors[0])
-                    noise_mask = np.random.rand(ps, ps) < noise_prob
-                    if np.any(noise_mask):
-                        rand_noise_c = np.random.choice(used_colors, size=(ps, ps))
-                        c_ids = np.where(noise_mask, rand_noise_c, c_ids)
-                    color_id_grids[b] = c_ids
-                    
+                    # Soft edge simulation using smoothstep / interpolation
+                    if np.random.rand() < 0.4:
+                        # Soft gradient blending across the boundary
+                        alpha = np.clip((vals + 1.0) / 2.0, 0.0, 1.0)
+                        c1 = palettes[b, used_colors[0]]
+                        c2 = palettes[b, used_colors[1 % num_used]]
+                        patch_grid = c1[None, None, :] * (1 - alpha[..., None]) + c2[None, None, :] * alpha[..., None]
+                    else:
+                        c_ids = np.where(vals >= 0, used_colors[1 % num_used], used_colors[0])
+                        noise_mask = np.random.rand(ps, ps) < noise_prob
+                        if np.any(noise_mask):
+                            rand_noise_c = np.random.choice(used_colors, size=(ps, ps))
+                            c_ids = np.where(noise_mask, rand_noise_c, c_ids)
+                        patch_grid = palettes[b, c_ids]
+                        
                 elif st == 'circle':
                     cx = np.random.uniform(2, ps - 3)
                     cy = np.random.uniform(2, ps - 3)
                     r = np.random.uniform(1.5, ps / 2.2)
                     dists = np.sqrt((x_indices - cx)**2 + (y_indices - cy)**2)
                     c_ids = np.where(dists <= r, used_colors[1 % num_used], used_colors[0])
-                    noise_mask = np.random.rand(ps, ps) < noise_prob
-                    if np.any(noise_mask):
-                        rand_noise_c = np.random.choice(used_colors, size=(ps, ps))
-                        c_ids = np.where(noise_mask, rand_noise_c, c_ids)
-                    color_id_grids[b] = c_ids
+                    patch_grid = palettes[b, c_ids]
                     
-                elif st == 'rect':
-                    rx1, ry1 = np.random.uniform(0, 2, 2)
-                    rx2, ry2 = np.random.uniform(ps - 3, ps, 2)
-                    inside = (rx1 <= x_indices) & (x_indices <= rx2) & (ry1 <= y_indices) & (y_indices <= ry2)
-                    c_ids = np.where(inside, used_colors[1 % num_used], used_colors[0])
-                    noise_mask = np.random.rand(ps, ps) < noise_prob
-                    if np.any(noise_mask):
-                        rand_noise_c = np.random.choice(used_colors, size=(ps, ps))
-                        c_ids = np.where(noise_mask, rand_noise_c, c_ids)
-                    color_id_grids[b] = c_ids
+                elif st == 'smooth_grad':
+                    # Soft blurred gradient fill simulating real-world shadow/blur
+                    dx = np.random.uniform(-1, 1)
+                    dy = np.random.uniform(-1, 1)
+                    vals = dx * (x_indices - center_idx) + dy * (y_indices - center_idx)
+                    alpha = 1.0 / (1.0 + np.exp(-vals)) # Sigmoid smooth edge
+                    c1 = palettes[b, used_colors[0]]
+                    c2 = palettes[b, used_colors[1 % num_used]]
+                    patch_grid = c1[None, None, :] * (1 - alpha[..., None]) + c2[None, None, :] * alpha[..., None]
                     
                 else:
                     centers = [(np.random.uniform(0, ps), np.random.uniform(0, ps)) for _ in range(num_used)]
                     dists_stack = np.stack([np.sqrt((x_indices - cx)**2 + (y_indices - cy)**2) for cx, cy in centers], axis=-1)
                     closest_idxs = np.argmin(dists_stack, axis=-1)
-                    color_id_grids[b] = used_colors[closest_idxs % num_used]
+                    c_ids = used_colors[closest_idxs % num_used]
+                    patch_grid = palettes[b, c_ids]
 
-            grids = np.zeros((current_batch_size, ps, ps, 3), dtype=np.float32)
-            for b in range(current_batch_size):
-                grids[b] = palettes[b, color_id_grids[b]]
-
-            noise = np.random.normal(0, 0.04, size=(current_batch_size, ps, ps, 3))
-            grids = np.clip(grids + noise, 0.0, 1.0)
-            grids_transposed = np.transpose(grids, (0, 3, 1, 2))
-
-            for b in range(current_batch_size):
-                c_grid = color_id_grids[b]
-                center_color_id = c_grid[center_idx, center_idx]
+                # Add noise and blur optionally
+                noise = np.random.normal(0, 0.03, size=(ps, ps, 3))
+                patch_grid = np.clip(patch_grid + noise, 0.0, 1.0)
                 
-                neighbor_colors = []
+                # Extract center color & neighbors for ground truth computation
+                center_rgb = patch_grid[center_idx, center_idx]
+                
+                neighbor_rgbs = []
+                diff_count = 0
                 for oy, ox in neighbor_offsets:
                     ny_pos, nx_pos = center_idx + oy, center_idx + ox
                     if 0 <= ny_pos < ps and 0 <= nx_pos < ps:
-                        neighbor_colors.append(c_grid[ny_pos, nx_pos])
+                        n_rgb = patch_grid[ny_pos, nx_pos]
+                        neighbor_rgbs.append(n_rgb)
+                        # Color distance to measure boundary degree
+                        if np.mean(np.abs(n_rgb - center_rgb)) > 0.12:
+                            diff_count += 1
                 
-                different_count = sum(1 for n_id in neighbor_colors if n_id != center_color_id)
-                is_on_boundary = (different_count >= 3)
+                # Continuous label based on neighbor variation (0.0 to 1.0)
+                edge_score = float(diff_count) / 8.0
                 
-                query_color_ids = []
-                diff_neighbor_ids = [n_id for n_id in neighbor_colors if n_id != center_color_id]
-                
-                num_query_colors = np.random.randint(2, self.max_query_colors + 1)
-                
-                # Use boundary color (RGB) when on an edge as the correct color
-                edge_rgb = palettes[b, center_color_id] # Default
-                
-                if is_on_boundary and np.random.rand() < 0.85 and len(diff_neighbor_ids) > 0:
-                    boundary_neighbor_id = np.random.choice(diff_neighbor_ids)
-                    query_color_ids.append(center_color_id)
-                    query_color_ids.append(boundary_neighbor_id)
-                    
-                    # Target line color (e.g., average of center and neighbor colors, or one of them)
-                    edge_rgb = (palettes[b, center_color_id] + palettes[b, boundary_neighbor_id]) / 2.0
-                    
-                    used_colors = np.unique(c_grid)
-                    other_c = [c for c in used_colors if c != center_color_id and c != boundary_neighbor_id]
-                    for oc in other_c[:num_query_colors - 2]:
-                        query_color_ids.append(oc)
-                    
-                    while len(query_color_ids) < num_query_colors:
-                        rand_c = np.random.randint(0, self.num_palette_colors)
-                        if rand_c not in query_color_ids:
-                            query_color_ids.append(rand_c)
-                    label = 1.0
+                # Target line color (average of center and surrounding differing colors)
+                if diff_count > 0:
+                    differing = [n for n in neighbor_rgbs if np.mean(np.abs(n - center_rgb)) > 0.12]
+                    edge_rgb = np.mean([center_rgb] + differing, axis=0)
                 else:
-                    query_color_ids = list(np.random.choice(self.num_palette_colors, size=min(num_query_colors, self.num_palette_colors), replace=False))
-                    while len(query_color_ids) < num_query_colors:
-                        rand_c = np.random.randint(0, self.num_palette_colors)
-                        if rand_c not in query_color_ids:
-                            query_color_ids.append(rand_c)
-                    
-                    match_found = False
-                    if is_on_boundary:
-                        q_set = set(query_color_ids)
-                        if center_color_id in q_set and any(n_id in q_set for n_id in neighbor_colors if n_id != center_color_id):
-                            match_found = True
-                    label = 1.0 if match_found else 0.0
+                    edge_rgb = center_rgb
 
-                query_colors_list = [palettes[b, cid] for cid in query_color_ids[:num_query_colors]]
-                np.random.shuffle(query_colors_list)
+                # Construct 40-dimensional brightness-sorted query vector [R, G, B, flag] x 10
+                query_colors_list = []
+                # Pick some palette colors including present ones
+                query_palette_ids = list(np.random.choice(self.num_palette_colors, size=min(np.random.randint(2, self.max_query_colors + 1), self.num_palette_colors), replace=False))
                 
-                query_vector = np.zeros(self.max_query_colors * 3, dtype=np.float32)
-                flat_qc = np.concatenate(query_colors_list) if len(query_colors_list) > 0 else np.zeros(3)
-                query_vector[:len(flat_qc)] = flat_qc
+                for pid in query_palette_ids:
+                    query_colors_list.append(palettes[b, pid])
+                
+                # Sort query colors by brightness (R+G+B) for invariant ordered representation
+                query_colors_list.sort(key=lambda c: np.sum(c))
+                
+                query_vector = np.zeros(self.max_query_colors * 4, dtype=np.float32)
+                for q_i, q_c in enumerate(query_colors_list[:self.max_query_colors]):
+                    query_vector[q_i * 4 : q_i * 4 + 3] = q_c
+                    query_vector[q_i * 4 + 3] = 1.0  # Existence flag = 1.0
 
-                X_patches.append(grids_transposed[b])
+                X_patches.append(np.transpose(patch_grid, (2, 0, 1)))
                 X_queries.append(query_vector)
                 
-                # Teacher data: [label, R, G, B] (total 4 dimensions)
-                target_vector = np.array([label, edge_rgb[0], edge_rgb[1], edge_rgb[2]], dtype=np.float32)
+                target_vector = np.array([edge_score, edge_rgb[0], edge_rgb[1], edge_rgb[2]], dtype=np.float32)
                 y_data.append(target_vector)
 
         gen_elapsed = time.time() - start_t
-        print(f"✅ Vectorized 4D Training Data generation completed in {gen_elapsed:.2f}s ({num_samples:,} samples)")
+        print(f"✅ Optimized Training Data generation completed in {gen_elapsed:.2f}s ({num_samples:,} samples)")
 
         X_p_arr = np.array(X_patches, dtype=np.float32)
         X_q_arr = np.array(X_queries, dtype=np.float32)
@@ -301,7 +272,7 @@ class BoundaryFilter(nn.Module):
         return X_p_arr, X_q_arr, y_arr
 
     def train_model(self, epochs=45, batch_size=128, num_samples=200000, patience=12):
-        self._log(f"Training 4D-output model with {num_samples:,} samples...")
+        self._log(f"Training Optimized 4D-output model with {num_samples:,} samples...")
         
         X_patches, X_queries, y_data = self._generate_training_data(num_samples)
 
@@ -319,22 +290,17 @@ class BoundaryFilter(nn.Module):
 
         self.to(self.device)
         
-        # 1. Slightly adjust learning rate (0.0015 -> 0.001)
         optimizer = optim.AdamW(self.parameters(), lr=0.001, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-6)
         
-        # 2. Optimize loss function: consider pos_weight for edge detection, and use SmoothL1Loss robustly for colors
-        # Adjust pos_weight according to the edge ratio (e.g., increase positive class weight by 1.8x since edges are sparse)
-        pos_weight = torch.tensor([1.8], device=self.device)
-        bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        
-        # Adopt SmoothL1Loss (Huber Loss), which is robust to outliers, instead of MSELoss
+        # Since edge score is now a continuous target [0, 1], use SmoothL1Loss / MSELoss for both edge and color
+        edge_criterion = nn.SmoothL1Loss(beta=0.2)
         color_criterion = nn.SmoothL1Loss(beta=0.2)
 
         best_loss = float('inf')
         patience_counter = 0
 
-        print(f"\n--- 🚀 {self.patch_size}x{self.patch_size} BoundaryFilter (4D Output - Enhanced) Training Started ---")
+        print(f"\n--- 🚀 {self.patch_size}x{self.patch_size} BoundaryFilter (Optimized 4D Output) Training Started ---")
         total_train_start = time.time()
 
         for epoch in range(epochs):
@@ -353,24 +319,19 @@ class BoundaryFilter(nn.Module):
                 b_x, b_q, b_y = b_x.to(self.device), b_q.to(self.device), b_y.to(self.device)
                 optimizer.zero_grad()
                 
-                preds = self(b_x, b_q)  # (B, 4) -> [logit_edge, R_pred, G_pred, B_pred]
+                preds = self(b_x, b_q)  # (B, 4) -> [edge_score, R_pred, G_pred, B_pred]
                 
-                # Loss calculation (edge presence + predicted color)
-                loss_edge = bce_criterion(preds[:, 0:1], b_y[:, 0:1])
+                # Loss calculation with continuous edge score
+                loss_edge = edge_criterion(preds[:, 0:1], b_y[:, 0:1])
                 
-                # Make color loss strongly effective only on samples where "edge exists (y_data[:, 0] == 1)",
-                # or take the average across the whole (here, apply a mask or weight to prioritize color learning on edges)
-                edge_mask_weight = b_y[:, 0:1] # 1.0 only on edges, 0.0 (or negligible) on non-edges
-                # To prevent loss from exploding when trying to force color matching on non-edge parts, prioritize color matching on edge parts
+                # Weight color loss effectively where edge exists (b_y[:, 0:1] > 0.1)
+                edge_mask_weight = b_y[:, 0:1]
                 loss_color = color_criterion(preds[:, 1:] * edge_mask_weight, b_y[:, 1:] * edge_mask_weight)
                 
-                # Combine multi-task losses (edge detection 1.0 vs color 0.8 balance)
                 loss = loss_edge + 0.8 * loss_color
                 
                 loss.backward()
-                # Gradient clipping to improve training stability
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                
                 optimizer.step()
                 
                 train_loss += loss.item() * b_x.size(0)
@@ -392,7 +353,7 @@ class BoundaryFilter(nn.Module):
                     b_x, b_q, b_y = b_x.to(self.device), b_q.to(self.device), b_y.to(self.device)
                     preds = self(b_x, b_q)
                     
-                    loss_edge = bce_criterion(preds[:, 0:1], b_y[:, 0:1])
+                    loss_edge = edge_criterion(preds[:, 0:1], b_y[:, 0:1])
                     edge_mask_weight = b_y[:, 0:1]
                     loss_color = color_criterion(preds[:, 1:] * edge_mask_weight, b_y[:, 1:] * edge_mask_weight)
                     loss = loss_edge + 0.8 * loss_color
