@@ -1,0 +1,8 @@
+[app]
+dataset_dir = "dataset"
+log_dir = "log"
+space_dir = "space"
+
+# Size and sampling settings
+patch_size = 9
+boundary_retention_percent = 20

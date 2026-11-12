@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "v1ai"
+version = "0.1.0"
+description = "V1AI - Primary Vision AI"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "scikit-learn",
+    "torch",
+    "torchvision",
+    "tqdm",
+    "pillow",
+]
+
+[project.scripts]
+v1ai = "v1ai.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/v1ai"]
