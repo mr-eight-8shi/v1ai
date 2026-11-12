@@ -5,6 +5,7 @@
 V1AI is a lightweight, general-purpose vision system inspired by the early visual cortex (V1) in biological vision.
 
 Without pre-memorizing specific object categories, it uses a unique mechanism to observe and integrate images from multiple views (multi-view), automatically extracting key objects and boundaries from any unseen image.
+<img width="4377" height="1675" alt="image" src="https://github.com/user-attachments/assets/fc9a373d-8f90-4d68-901c-5a2435e62722" />
 
 * ✋ **Human-labeled data**: 0 (trained exclusively on programmatically auto-generated data)
 * 📦 **Model size**: ~5MB (Total parameters under 1.3M: ColorExtractor ~115K, BoundaryFilter ~941K, ObjectExtractor ~306K)
@@ -99,19 +100,18 @@ V1AI covers the domain leading up to semantics—specifically **"Light ➔ Bound
 * Outputs a total of 40 dimensions (5 object colors × 4, 5 background colors × 4) via a lightweight CNN backbone and fully connected layers (with Sigmoid activation).
 * Each color consists of 4 dimensions [R, G, B, Exists Flag], eliminating the Hungarian algorithm through luminance sorting and existence flags.
 * Applies a circular logical mask (radius 16) to extract color candidates (inside as object, outside as background).
-
+<img width="1000" alt="regional_extractor_32x32_v2_samples" src="https://github.com/user-attachments/assets/55b5d71e-5190-487f-a6dc-d4a2df6b3e7a" />
 
 2. **BoundaryFilter ($9\times9$)**
 * Uses `torch.unfold` to extract $9\times9$ patches (input dimension 243) sliding across the entire image with a stride of 1.
 * Combines up to 10 color query vectors (30 dimensions) with patch features and feeds them into an MLP.
 * Applies a dynamic quantile threshold (e.g., top 20%, lower bound 0.40) to generate stable edge maps.
-
+<img width="1000" alt="training_samples_visualization" src="https://github.com/user-attachments/assets/906d64ac-69f3-4b32-a22f-3fb96dd0b39b" />
 
 3. **ObjectExtractorFilter ($9\times9$)**
 * Combines patch features (243 dimensions) with 30 query dimensions (5 object colors [15 dim] + 5 background colors [15 dim]) for a total of 273 dimensions, processed through fully connected layers.
 * Outputs background probabilities and RGB predictions for non-background regions.
-
-
+<img width="1000" alt="object_extractor_training_samples_visualization" src="https://github.com/user-attachments/assets/0a67244a-52d7-4bce-815b-75e121cd06b4" />
 
 ---
 
@@ -158,6 +158,8 @@ You can also run tasks directly by passing arguments:
 * **[4] Run Visualizer Pipeline**: `v1ai visual`
 * **[9] Initialize Workspace**: `v1ai init`
 
+<img width="3775" height="2985" alt="pipeline_4row_5col_grid_10" src="https://github.com/user-attachments/assets/4e50d5be-5673-4e28-a00e-72d8eb07a30a" />
+
 ---
 
 ## 🎯 Use Cases & Expected Effects
@@ -177,6 +179,7 @@ You can also run tasks directly by passing arguments:
 V1AIは、生物の視覚における初期視覚域（V1）に着想を得た軽量汎用ビジョンシステムです。
 
 特定の物体カテゴリを事前に記憶せず、マルチビュー（複数の視点）から画像を観察・統合する独自の仕組みにより、**あらゆる未知の画像に対しても主要な物体や境界を自律的に抽出します。**
+<img width="4377" height="1675" alt="image" src="https://github.com/user-attachments/assets/fc9a373d-8f90-4d68-901c-5a2435e62722" />
 
 * ✋ **Human-labeled data**: 0枚（プログラムによる完全自動生成データのみで学習）
 * 📦 **Model size**: 約5MB（各モデルのパラメータ数：ColorExtractor 約115K、BoundaryFilter 約941K、ObjectExtractor 約306K、合計約1.3Mパラメータ）
@@ -271,19 +274,18 @@ V1AIはこのうち、知識ベースに至る手前の **「光 ➔ 境界 ➔ 
 * 軽量CNNバックボーンと全結合層により、計40次元（物体側5色×4、背景側5色×4）を出力します。
 * 各色は [R, G, B, 存在フラグ] の4次元で構成され、輝度ソートによる順序固定と存在フラグの導入によってハンガリアン法を廃止しています。
 * 中心半径16の円論理マスクを適用し、円内を物体側、円外を背景側として色候補を抽出します。
-
+<img width="1000" alt="regional_extractor_32x32_v2_samples" src="https://github.com/user-attachments/assets/55b5d71e-5190-487f-a6dc-d4a2df6b3e7a" />
 
 2. **BoundaryFilter ($9\times9$)**
 * `torch.unfold` を用いて、パッチサイズ $9\times9$（入力次元 $243$）のパッチを画像全体に1ストライドで展開します。
 * 最大10色分（30次元）の色クエリベクトルとパッチ特徴量を結合し、MLPに入力します。
 * 動的分位点しきい値（例: 上位20%、下限0.40）を適用して安定したエッジマップを生成します。
-
+<img width="1000" alt="training_samples_visualization" src="https://github.com/user-attachments/assets/906d64ac-69f3-4b32-a22f-3fb96dd0b39b" />
 
 3. **ObjectExtractorFilter ($9\times9$)**
 * パッチ特徴量（$243$次元）と物体側5色（15次元）・背景側5色（15次元）の合計30次元のクエリを入力し、全結合層で処理します。
 * 背景確率と非背景領域のRGB予測を行います。
-
-
+<img width="1000" alt="object_extractor_training_samples_visualization" src="https://github.com/user-attachments/assets/0a67244a-52d7-4bce-815b-75e121cd06b4" />
 
 ---
 
@@ -329,6 +331,9 @@ Enter choice:
 * **[3] 物体抽出フィルターの訓練** (`v1ai train-extractor`)
 * **[4] ビジュアライザ・推論パイプラインの実行** (`v1ai visual`)
 * **[9] ワークスペースの初期化** (`v1ai init`)
+
+<img width="3775" height="2985" alt="pipeline_4row_5col_grid_10" src="https://github.com/user-attachments/assets/4e50d5be-5673-4e28-a00e-72d8eb07a30a" />
+
 
 ---
 
