@@ -158,6 +158,8 @@ You can also run tasks directly by passing arguments:
 * **[4] Run Visualizer Pipeline**: `v1ai visual`
 * **[9] Initialize Workspace**: `v1ai init`
 
+<img width="3775" height="2985" alt="pipeline_4row_5col_grid_10" src="https://github.com/user-attachments/assets/4e50d5be-5673-4e28-a00e-72d8eb07a30a" />
+
 ---
 
 ## 🎯 Use Cases & Expected Effects
@@ -329,6 +331,9 @@ Enter choice:
 * **[3] 物体抽出フィルターの訓練** (`v1ai train-extractor`)
 * **[4] ビジュアライザ・推論パイプラインの実行** (`v1ai visual`)
 * **[9] ワークスペースの初期化** (`v1ai init`)
+
+<img width="3775" height="2985" alt="pipeline_4row_5col_grid_10" src="https://github.com/user-attachments/assets/4e50d5be-5673-4e28-a00e-72d8eb07a30a" />
+
 
 ---
 
